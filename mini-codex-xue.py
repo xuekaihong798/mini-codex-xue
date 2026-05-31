@@ -10,7 +10,8 @@ Architecture:
                                    ├── search_code (ripgrep)
                                    ├── git_diff
                                    ├── run_compile (mvn)
-                                   └── run_tests (mvn)
+                                   ├── run_tests (mvn)
+                                   └── rollback (git reset)
 """
 
 import json, os, subprocess, sys, time
@@ -114,6 +115,18 @@ TOOLS = [
         "function": {
             "name": "run_tests",
             "description": "Run 'mvn test'. Returns {passed, failed, total, errors[]}. Call AFTER compile succeeds.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rollback",
+            "description": "Discard ALL uncommitted changes and restore workspace to last commit. Use when compile or tests fail and you cannot fix the errors. This is a DESTRUCTIVE operation — use only as last resort.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -268,6 +281,14 @@ def dispatch(tool_call: dict) -> dict:
         except subprocess.TimeoutExpired:
             return {"error": "tests timed out"}
 
+    elif fn == "rollback":
+        r = subprocess.run(["git", "reset", "--hard", "HEAD"],
+                           capture_output=True, text=True, timeout=10, cwd=ALLOWED_ROOT)
+        subprocess.run(["git", "clean", "-fd"],
+                       capture_output=True, timeout=10, cwd=ALLOWED_ROOT)
+        out = r.stdout.strip() or "workspace reset to HEAD"
+        return {"result": out, "rollback": True}
+
     return {"error": f"unknown tool: {fn}"}
 
 
@@ -280,6 +301,17 @@ class AgentState:
         self.tests_passed: int | None = None
         self.tests_failed: int | None = None
         self.compile_success: bool | None = None
+        self.rollbacks: int = 0
+
+    def reset(self):
+        """Reset state after rollback — all file changes are discarded."""
+        self.files_read.clear()
+        self.files_modified.clear()
+        self.tests_run = False
+        self.tests_passed = None
+        self.tests_failed = None
+        self.compile_success = None
+        self.rollbacks += 1
 
     def status_text(self) -> str:
         lines = ["## Current State"]
@@ -305,6 +337,8 @@ class AgentState:
             lines.append("  not run yet")
         else:
             lines.append(f"  {self.tests_passed}/{self.tests_passed + self.tests_failed} passed")
+        if self.rollbacks > 0:
+            lines.append(f"### Rollbacks: {self.rollbacks}")
         return "\n".join(lines)
 
 
@@ -319,8 +353,9 @@ def agent(task: str) -> dict:
         "2. READ files you plan to modify\n"
         "3. WRITE modified files with complete content\n"
         "4. CHECK your work with git_diff\n"
-        "5. COMPILE with run_compile\n"
-        "6. TEST with run_tests\n"
+        "5. COMPILE with run_compile — if it fails, fix the errors\n"
+        "6. TEST with run_tests — if tests fail, fix the bugs\n"
+        "7. ROLLBACK with rollback tool ONLY if you cannot fix errors after 3 attempts\n"
         "NEVER write a file without reading it first.\n"
         "NEVER skip compilation before running tests.\n"
         "Output your summary in Chinese."
@@ -332,6 +367,7 @@ def agent(task: str) -> dict:
         "compile_success": False,
         "tests_passed": 0,
         "tests_failed": 0,
+        "rollbacks": 0,
         "duration": 0,
         "steps": 0,
     }
@@ -368,6 +404,7 @@ def agent(task: str) -> dict:
             metrics["duration"] = int(time.time() - t0)
             metrics["steps"] = step + 1
             metrics["files_modified"] = len(state.files_modified)
+            metrics["rollbacks"] = state.rollbacks
             return metrics
 
         for tc in tool_calls:
@@ -400,6 +437,12 @@ def agent(task: str) -> dict:
                 if isinstance(r, dict):
                     state.compile_success = r.get("success", False)
                     metrics["compile_success"] = r.get("success", False)
+            elif name == "rollback":
+                state.reset()
+                metrics["rollbacks"] = state.rollbacks
+                metrics["compile_success"] = False
+                metrics["tests_passed"] = 0
+                metrics["tests_failed"] = 0
 
             metrics["tool_calls"] += 1
 
@@ -420,39 +463,106 @@ def agent(task: str) -> dict:
     metrics["duration"] = int(time.time() - t0)
     metrics["steps"] = MAX_STEPS
     metrics["files_modified"] = len(state.files_modified)
+    metrics["rollbacks"] = state.rollbacks
     print("  [max_steps] Reached limit")
     return metrics
 
 
 # ── Benchmark Runner ─────────────────────────────────
 BENCHMARK_TASKS = {
-    "single_phone_validate": {
-        "name": "Add isValidPhoneForCountry method",
+    # ── 单文件修改 (4 tasks) ─────────────────────────
+    "s1_add_method": {
+        "name": "[单文件] 添加 isValidPhoneForCountry",
         "task": (
             "在 UserService.java 中添加一个新方法 isValidPhoneForCountry(String phone, String country)。\n"
-            "country 参数支持 \"CN\" 和 \"JP\"，分别调用现有的中国和日本号码规则。\n"
-            "未知 country 返回 false。\n"
+            "country 参数支持 \"CN\" 和 \"JP\"，分别使用现有的中国和日本号码正则规则。\n"
+            "未知 country 返回 false。编译通过后运行测试。"
+        )
+    },
+    "s2_add_overload": {
+        "name": "[单文件] formatPhone 增加重载",
+        "task": (
+            "修改 UserService.java 的 formatPhone 方法，增加一个重载版本 formatPhone(String phone, String country)。\n"
+            "日本号码格式为 XXX-XXXX-XXXX，中国号码格式为 XXX-XXXX-XXXX。\n"
+            "先 read_file 再修改。编译通过后运行测试。"
+        )
+    },
+    "s3_add_email": {
+        "name": "[单文件] 添加 isValidEmail",
+        "task": (
+            "在 UserService.java 中添加 isValidEmail(String email) 方法。\n"
+            "规则：必须包含 @，@ 前后至少 1 个字符，总长度不超过 254。\n"
+            "用 search_code 找到 UserService.java 的位置，read_file 读取后修改。\n"
             "编译通过后运行测试。"
         )
     },
-    "single_format_update": {
-        "name": "Update formatPhone with country param",
+    "s4_add_javadoc": {
+        "name": "[单文件] 添加完整 Javadoc",
         "task": (
-            "修改 UserService.java 的 formatPhone 方法，增加一个重载版本：\n"
-            "formatPhone(String phone, String country)。\n"
-            "日本号码格式为 XXX-XXXX-XXXX，中国号码格式为 XXX-XXXX-XXXX。\n"
-            "需要先 read_file 再修改，修改后编译并运行测试。"
+            "为 UserService.java 中所有 public 方法添加完整的 Javadoc 注释。\n"
+            "每个方法需要 @param 和 @return 标签。不修改方法逻辑。\n"
+            "编译通过即成功。"
         )
     },
-    "multi_cross_file": {
-        "name": "Create PhoneValidator + refactor UserService",
+    # ── 跨文件修改 (4 tasks) ─────────────────────────
+    "m1_extract_validator": {
+        "name": "[跨文件] 提取 PhoneValidator",
         "task": (
-            "1. 创建新文件 src/main/java/com/example/PhoneValidator.java，包含：\n"
-            "   - public static boolean isValidPhone(String phone) — 支持中国和日本号码\n"
-            "   - public static String formatPhone(String phone) — 格式化号码\n"
+            "1. 创建 src/main/java/com/example/PhoneValidator.java，包含：\n"
+            "   - public static boolean isValidPhone(String phone)\n"
+            "   - public static String formatPhone(String phone)\n"
             "2. 修改 UserService.java，让 isValidPhone 和 formatPhone 委托给 PhoneValidator\n"
-            "3. 修改 UserServiceTest.java 或 TestRunner.java，确保测试仍然通过\n"
-            "完成后编译并运行测试验证。"
+            "3. 修改 TestRunner.java 让测试仍然通过\n"
+            "用 search_code 找到所有相关文件。编译通过后运行测试。"
+        )
+    },
+    "m2_create_order_svc": {
+        "name": "[跨文件] 创建 OrderService + 测试",
+        "task": (
+            "1. 创建 src/main/java/com/example/OrderService.java，包含：\n"
+            "   - public boolean validateOrderPhone(String phone) — 调用 UserService.isValidPhone\n"
+            "2. 修改 TestRunner.java，增加 2 个测试：validOrderPhone（用合法号码）和 invalidOrderPhone（用非法号码）\n"
+            "编译通过后运行测试。"
+        )
+    },
+    "m3_rename_method": {
+        "name": "[跨文件] 全局重命名方法",
+        "task": (
+            "将 UserService.java 中的 isValidPhone 方法重命名为 validatePhoneNumber。\n"
+            "必须用 search_code 搜索所有引用，同步修改 TestRunner.java 和 UserServiceTest.java。\n"
+            "不能遗漏任何引用。编译通过后运行测试。"
+        )
+    },
+    "m4_extract_string_utils": {
+        "name": "[跨文件] 提取 StringUtils + 重构",
+        "task": (
+            "1. 创建 src/main/java/com/example/StringUtils.java，包含：\n"
+            "   - public static boolean isEmpty(String s)\n"
+            "   - public static String removeNonDigit(String s) — 去掉所有非数字字符\n"
+            "2. 修改 UserService.java 的 normalizePhone 使用 StringUtils.removeNonDigit\n"
+            "3. 修改 TestRunner.java，增加 StringUtils 的测试\n"
+            "编译通过后运行测试。"
+        )
+    },
+    # ── 错误恢复 (2 tasks) ───────────────────────────
+    "e1_compile_repair": {
+        "name": "[错误恢复] 编译失败 → 修复",
+        "task": (
+            "在 UserService.java 中把 isValidPhone 返回类型从 boolean 改成 int（制造编译错误）。\n"
+            "然后运行 run_compile，确认编译失败。\n"
+            "接着根据编译错误信息修回正确的 boolean 类型。\n"
+            "如果修了 3 次还失败就用 rollback 回滚。\n"
+            "最终必须编译通过。"
+        )
+    },
+    "e2_test_repair": {
+        "name": "[错误恢复] 测试失败 → 修复",
+        "task": (
+            "在 UserService.java 的 isValidPhone 方法中，故意让 080 开头的号码返回 false。\n"
+            "然后运行 run_tests，确认测试失败。\n"
+            "接着根据测试失败信息修复这个 bug，恢复 080 号码的支持。\n"
+            "如果修了 3 次还失败就用 rollback 回滚。\n"
+            "最终必须所有测试通过。"
         )
     },
 }
@@ -479,21 +589,52 @@ def run_benchmark(task_key: str) -> dict:
 
 
 def run_all_benchmarks():
-    """Run all benchmark tasks and print summary."""
+    """Run all benchmark tasks and print summary with category stats."""
     all_results = {}
     for key in BENCHMARK_TASKS:
         result = run_benchmark(key)
         all_results[key] = result
 
-    # Print final report
-    print(f"\n{'='*60}")
-    print("BENCHMARK REPORT")
-    print(f"{'='*60}")
+    # Categorize
+    categories = {"s": ("单文件修改", []), "m": ("跨文件修改", []), "e": ("错误恢复", [])}
+
+    print(f"\n{'='*70}")
+    print("BENCHMARK REPORT — mini-codex-xue (Gemma4 8B · Mac M5)")
+    print(f"{'='*70}")
+    print(f"{'Task':45s} {'Compile':8s} {'Tests':10s} {'Tools':6s} {'Time':6s} {'Rollback':9s}")
+    print("-" * 70)
+
     for key, r in all_results.items():
         name = BENCHMARK_TASKS[key]["name"]
         c = "PASS" if r["compile_success"] else "FAIL"
-        t = f"{r['tests_passed']}/{r['tests_passed'] + r['tests_failed']}"
-        print(f"  {name:40s}  compile:{c:5s}  tests:{t:8s}  tools:{r['tool_calls']:3d}  time:{r['duration']:3d}s")
+        total_tests = r["tests_passed"] + r["tests_failed"]
+        t = f"{r['tests_passed']}/{total_tests}" if total_tests > 0 else "-"
+        rb = str(r.get("rollbacks", 0))
+        print(f"  {name:43s} {c:8s} {t:10s} {r['tool_calls']:4d}   {r['duration']:3d}s  {rb:7s}")
+        cat = key[0]
+        if cat in categories:
+            categories[cat][1].append(r)
+
+    # Category summary
+    print(f"\n{'='*70}")
+    print("CATEGORY SUMMARY")
+    print(f"{'='*70}")
+    total_all = 0
+    passed_all = 0
+    for cat_key, (cat_name, results) in categories.items():
+        if not results:
+            continue
+        n = len(results)
+        compiled = sum(1 for r in results if r["compile_success"])
+        tests_ok = sum(1 for r in results if r["tests_failed"] == 0 and r["tests_passed"] > 0)
+        avg_tools = sum(r["tool_calls"] for r in results) / n
+        avg_time = sum(r["duration"] for r in results) / n
+        total_rollbacks = sum(r.get("rollbacks", 0) for r in results)
+        print(f"  {cat_name}: {n} tasks | compile {compiled}/{n} | tests {tests_ok}/{n} | avg {avg_tools:.1f} tools | avg {avg_time:.0f}s | {total_rollbacks} rollbacks")
+        total_all += n
+        passed_all += compiled
+
+    print(f"\n  TOTAL: {passed_all}/{total_all} compile pass ({100*passed_all/total_all:.0f}%)")
 
 
 # ── Rollback Tool ────────────────────────────────────
