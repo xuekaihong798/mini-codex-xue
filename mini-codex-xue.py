@@ -2585,7 +2585,6 @@ if __name__ == "__main__":
 
     # ── Workspace override ──
     if args.workspace:
-        global ALLOWED_ROOT
         ALLOWED_ROOT = os.path.realpath(args.workspace)
         print(f"[workspace] ALLOWED_ROOT = {ALLOWED_ROOT}")
         if not os.path.isdir(ALLOWED_ROOT):
