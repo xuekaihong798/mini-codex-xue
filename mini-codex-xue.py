@@ -2579,7 +2579,18 @@ if __name__ == "__main__":
                     help="Disable Agent Memory for this run")
     ap.add_argument("--memory-reset", action="store_true",
                     help="Reset (clear) the failure pattern database")
+    ap.add_argument("--workspace", "-w", default=None,
+                    help="Override ALLOWED_ROOT (use with external repos)")
     args = ap.parse_args()
+
+    # ── Workspace override ──
+    if args.workspace:
+        global ALLOWED_ROOT
+        ALLOWED_ROOT = os.path.realpath(args.workspace)
+        print(f"[workspace] ALLOWED_ROOT = {ALLOWED_ROOT}")
+        if not os.path.isdir(ALLOWED_ROOT):
+            print(f"ERROR: workspace path does not exist: {ALLOWED_ROOT}")
+            sys.exit(1)
 
     # ── Memory operations ──
     if args.memory_reset:
