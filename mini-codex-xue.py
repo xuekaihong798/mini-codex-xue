@@ -170,6 +170,70 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "edit_file",
+            "description": "PATCH a file by replacing old_text with new_text. This is the PRIMARY editing tool — use it INSTEAD of write_file for targeted changes. The system will locate old_text, replace it with new_text, and verify. Benefits: (a) no need to rewrite the entire file, (b) works on 3500+ line files, (c) atomic — if old_text not found, nothing changes. For large files (>500 lines), ALWAYS use edit_file instead of write_file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to edit"},
+                    "old_text": {"type": "string", "description": "EXACT text to find and replace. Include enough surrounding context to make it unique (3-5 lines before and after the change). Must match EXACTLY — same whitespace, same indentation."},
+                    "new_text": {"type": "string", "description": "Replacement text. The old_text will be replaced with this."},
+                    "reason": {"type": "string", "description": "Why this edit is needed (from root_cause_analyzer or task requirements)"}
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "locate_symbol",
+            "description": "Find WHERE a symbol (class/method/field) is defined in the codebase. Returns file, line number, and surrounding context. Use this BEFORE editing any symbol — it tells you exactly where to patch. Much more efficient than reading entire files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Symbol name to locate, e.g. 'isValidPhone', 'JSONObject', 'isRecordType'"},
+                    "kind": {"type": "string", "description": "Optional: 'class', 'method', 'field', or 'any' (default). Helps narrow the search."}
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_method",
+            "description": "Insert a new method into a class. Handles: finding the right insertion point, reading context, inserting with correct formatting. Use AFTER edit_file for method additions in large files. Returns the edited region for verification.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "File to insert into"},
+                    "after_method": {"type": "string", "description": "Name of the method to insert AFTER. Use 'class_start' to insert as the first method."},
+                    "method_source": {"type": "string", "description": "Complete method source code including signature and body. Must be valid Java."}
+                },
+                "required": ["file", "after_method", "method_source"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_symbol",
+            "description": "Rename a symbol (method/class/field) across the ENTIRE codebase. Finds ALL references, replaces each one, compiles after each change. Atomic per-file: if any file fails, it's restored. Use instead of manual search_code + multiple write_file calls.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_name": {"type": "string", "description": "Current symbol name to replace"},
+                    "new_name": {"type": "string", "description": "New symbol name"},
+                    "kind": {"type": "string", "description": "'method', 'class', or 'field'. Helps find the right references."}
+                },
+                "required": ["old_name", "new_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fix_single_error",
             "description": "COMPOUND TOOL: Read file, apply a targeted fix at a specific line, write file, compile — all in one atomic call. Reduces 4 round-trips to 1. Use after root_cause_analyzer has identified the exact fix. Returns: {fixed, compile_result, new_code_snippet}. If compile fails, the original file is restored.",
             "parameters": {
@@ -526,10 +590,13 @@ class ToolRouter:
     Reduces cognitive load: model only sees tools it should use right now.
     """
     # Tool name sets per profile
-    ESSENTIAL = {"read_file", "write_file", "run_compile", "run_tests"}
-    ERROR_RECOVERY = {"read_file", "write_file", "run_compile", "run_tests",
+    ESSENTIAL = {"read_file", "write_file", "edit_file", "insert_method",
+                 "rename_symbol", "locate_symbol", "run_compile", "run_tests"}
+    ERROR_RECOVERY = {"read_file", "write_file", "edit_file", "insert_method",
+                      "rename_symbol", "locate_symbol", "run_compile", "run_tests",
                       "analyze_error", "root_cause_analyzer"}
-    CROSS_FILE = {"read_file", "write_file", "run_compile", "run_tests",
+    CROSS_FILE = {"read_file", "write_file", "edit_file", "insert_method",
+                  "rename_symbol", "locate_symbol", "run_compile", "run_tests",
                   "search_code", "list_files", "git_diff",
                   "analyze_error", "root_cause_analyzer"}
     FULL = {t["function"]["name"] for t in TOOLS}
@@ -618,6 +685,10 @@ def dispatch(tool_call: dict) -> dict:
             return {"error": f"not found: {args['path']}"}
 
     elif fn == "write_file":
+        if "path" not in args:
+            return {"error": "missing required argument: 'path'. Must specify which file to write to."}
+        if "content" not in args:
+            return {"error": "missing required argument: 'content'. Must provide the complete file content."}
         ok, real = check_path(args["path"])
         if not ok: return {"error": real}
         content = args.get("content", "")
@@ -916,6 +987,232 @@ def dispatch(tool_call: dict) -> dict:
             "all_pass": compile_ok and (test_result and test_result.get("failed", 1) == 0) if test_result else compile_ok
         }}
 
+    elif fn == "edit_file":
+        path = args.get("path", "")
+        old_text = args.get("old_text", "")
+        new_text = args.get("new_text", "")
+        reason = args.get("reason", "")
+        ok, real = check_path(path)
+        if not ok: return {"error": real}
+        if not old_text:
+            return {"error": "old_text is required — provide the exact text to replace"}
+        try:
+            with open(real) as f:
+                content = f.read()
+        except FileNotFoundError:
+            return {"error": f"not found: {path}"}
+
+        # Count occurrences
+        count = content.count(old_text)
+        if count == 0:
+            # Try fuzzy: show what might be close
+            lines = content.split("\n")
+            first_old_line = old_text.split("\n")[0].strip()
+            candidates = []
+            for i, line in enumerate(lines):
+                if first_old_line[:30] in line or line.strip()[:30] in first_old_line:
+                    candidates.append(f"  line {i+1}: {line.strip()[:100]}")
+            hint = ""
+            if candidates:
+                hint = f"\nPossible matches (check whitespace/indentation):\n" + "\n".join(candidates[:5])
+            return {"error": f"old_text not found in file (0 occurrences). Text was:\n---\n{old_text[:200]}\n---{hint}"}
+        elif count > 1:
+            return {"error": f"old_text found {count} times — ambiguous. Include MORE surrounding context (5+ lines) to make it unique."}
+
+        new_content = content.replace(old_text, new_text, 1)
+        with open(real, "w") as f:
+            f.write(new_content)
+
+        # Show what changed
+        old_preview = old_text[:120].replace("\n", "\\n")
+        new_preview = new_text[:120].replace("\n", "\\n")
+        return {"result": {
+            "patched": True,
+            "file": path,
+            "reason": reason,
+            "old_text_preview": old_preview,
+            "new_text_preview": new_preview,
+            "hint": "File patched. Call run_compile or verify_changes to verify."
+        }}
+
+    elif fn == "locate_symbol":
+        symbol = args.get("symbol", "")
+        kind = args.get("kind", "any")
+        if not symbol:
+            return {"error": "symbol is required"}
+        # Use ripgrep to find the definition
+        # For method: look for 'symbol(' or 'symbol ('
+        # For class: look for 'class symbol'
+        # For field: look for 'symbol;' or 'symbol ='
+        patterns = {
+            "method": rf"(?:public|private|protected|static|\s)+\w+\s+{re.escape(symbol)}\s*\(",
+            "class": rf"class\s+{re.escape(symbol)}\b",
+            "field": rf"(?:public|private|protected|static|\s)+\w+\s+{re.escape(symbol)}\s*[=;]",
+            "any": rf"(?:class\s+{re.escape(symbol)}\b|(?:\w+\s+){re.escape(symbol)}\s*[\(=;])",
+        }
+        pattern = patterns.get(kind, patterns["any"])
+        try:
+            r = subprocess.run(
+                ["/opt/homebrew/bin/rg", "--no-heading", "-n", "--color", "never", pattern, ALLOWED_ROOT],
+                capture_output=True, text=True, timeout=15, cwd=ALLOWED_ROOT
+            )
+            out = r.stdout.strip()
+            if not out:
+                return {"result": {"found": False, "symbol": symbol, "kind": kind, "message": f"Symbol '{symbol}' not found in codebase"}}
+
+            # Parse results
+            results = []
+            for line in out.split("\n")[:20]:
+                parts = line.split(":", 2)
+                if len(parts) >= 3:
+                    file_path = parts[0]
+                    line_no = int(parts[1])
+                    content_line = parts[2].strip()
+                    results.append({"file": file_path, "line": line_no, "content": content_line[:200]})
+
+            # For the first result, read surrounding context
+            context = ""
+            if results:
+                first = results[0]
+                try:
+                    with open(first["file"]) as f:
+                        lines = f.readlines()
+                    start = max(0, first["line"] - 6)
+                    end = min(len(lines), first["line"] + 5)
+                    context = "".join(lines[start:end])
+                except Exception:
+                    pass
+
+            return {"result": {
+                "found": True,
+                "symbol": symbol,
+                "kind": kind,
+                "occurrences": len(results),
+                "definitions": results[:10],
+                "primary_location": f"{results[0]['file']}:{results[0]['line']}",
+                "context": context[:1500],
+            }}
+        except subprocess.TimeoutExpired:
+            return {"error": "search timed out"}
+
+    elif fn == "insert_method":
+        file = args.get("file", "")
+        after_method = args.get("after_method", "")
+        method_source = args.get("method_source", "")
+        ok, real = check_path(file)
+        if not ok: return {"error": real}
+        try:
+            with open(real) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return {"error": f"not found: {file}"}
+
+        # Find insertion point
+        insert_after_line = -1
+        if after_method == "class_start":
+            # Find the opening brace of the class
+            for i, line in enumerate(lines):
+                if "{" in line and ("class " in lines[i-1] if i > 0 else True):
+                    insert_after_line = i
+                    break
+        else:
+            # Find the closing brace of the specified method
+            for i, line in enumerate(lines):
+                if re.search(rf"(?:public|private|protected|static|\s)+\w+\s+{re.escape(after_method)}\s*\(", line):
+                    # Found method start, now find its closing brace
+                    brace_count = 0
+                    in_method = False
+                    for j in range(i, len(lines)):
+                        brace_count += lines[j].count("{") - lines[j].count("}")
+                        if "{" in lines[j]:
+                            in_method = True
+                        if in_method and brace_count == 0:
+                            insert_after_line = j
+                            break
+                    break
+
+        if insert_after_line < 0:
+            return {"error": f"Could not find insertion point after '{after_method}'. Use locate_symbol to verify the method name."}
+
+        # Insert with proper indentation
+        indent = ""
+        for ch in lines[insert_after_line]:
+            if ch in " \t":
+                indent += ch
+            else:
+                break
+        formatted_method = "\n".join(indent + l if l.strip() else l for l in method_source.split("\n"))
+        new_lines = lines[:insert_after_line + 1] + ["\n", formatted_method + "\n", "\n"] + lines[insert_after_line + 1:]
+        new_content = "".join(new_lines)
+
+        with open(real, "w") as f:
+            f.write(new_content)
+
+        # Return context around insertion for verification
+        ctx_start = max(0, insert_after_line - 2)
+        ctx_end = min(len(new_lines), insert_after_line + len(formatted_method.split("\n")) + 4)
+        return {"result": {
+            "inserted": True,
+            "file": file,
+            "after_method": after_method,
+            "inserted_at_line": insert_after_line + 1,
+            "context": "".join(new_lines[ctx_start:ctx_end])[:1500],
+            "hint": "Method inserted. Call run_compile to verify."
+        }}
+
+    elif fn == "rename_symbol":
+        old_name = args.get("old_name", "")
+        new_name = args.get("new_name", "")
+        kind = args.get("kind", "method")
+        if not old_name or not new_name:
+            return {"error": "old_name and new_name are required"}
+
+        # Step 1: Find all occurrences
+        try:
+            r = subprocess.run(
+                ["/opt/homebrew/bin/rg", "--no-heading", "-n", "--color", "never", old_name, ALLOWED_ROOT],
+                capture_output=True, text=True, timeout=15, cwd=ALLOWED_ROOT
+            )
+            out = r.stdout.strip()
+            if not out:
+                return {"error": f"No occurrences of '{old_name}' found"}
+        except subprocess.TimeoutExpired:
+            return {"error": "search timed out"}
+
+        # Group by file
+        by_file: dict[str, list[dict]] = {}
+        for line in out.split("\n"):
+            parts = line.split(":", 2)
+            if len(parts) >= 3 and parts[0].endswith(".java"):
+                fp = parts[0]
+                if fp not in by_file:
+                    by_file[fp] = []
+                by_file[fp].append({"line": int(parts[1]), "content": parts[2].strip()})
+
+        # Step 2: Replace in each file
+        changes = []
+        for fp, occurrences in by_file.items():
+            try:
+                with open(fp) as f:
+                    content = f.read()
+                new_content = content.replace(old_name, new_name)
+                if new_content != content:
+                    with open(fp, "w") as f:
+                        f.write(new_content)
+                    changes.append({"file": fp, "occurrences_replaced": len(occurrences)})
+            except Exception as e:
+                return {"error": f"Failed to process {fp}: {e}"}
+
+        return {"result": {
+            "renamed": True,
+            "old_name": old_name,
+            "new_name": new_name,
+            "files_changed": len(changes),
+            "total_occurrences": sum(c["occurrences_replaced"] for c in changes),
+            "changes": changes,
+            "hint": "All references renamed. Call run_compile to verify."
+        }}
+
     elif fn == "rollback":
         r = subprocess.run(["git", "reset", "--hard", "HEAD"],
                            capture_output=True, text=True, timeout=10, cwd=ALLOWED_ROOT)
@@ -985,6 +1282,24 @@ class AgentState:
 
         elif tool_name == "root_cause_analyzer":
             self.current_phase = "fixing"
+
+        elif tool_name == "edit_file":
+            if self.current_phase in ("explain",):
+                return False  # BLOCKED in EXPLAIN
+            self._has_written = True
+            self.current_phase = "verifying"
+
+        elif tool_name == "insert_method":
+            if self.current_phase in ("explain",):
+                return False
+            self._has_written = True
+            self.current_phase = "verifying"
+
+        elif tool_name == "rename_symbol":
+            if self.current_phase in ("explain",):
+                return False
+            self._has_written = True
+            self.current_phase = "verifying"
 
         elif tool_name == "write_file":
             if self.current_phase in ("explain",):
@@ -1410,13 +1725,16 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
         "              └────────┘←── FAIL ────────┘\n"
         "\n"
         "PHASE RULES (ENFORCED — violations will be BLOCKED):\n"
-        "  OBSERVE:  search_code → read_file(offset=0,limit=200) → understand the code\n"
-        "            ⚠ For files >800 lines: use offset/limit, NEVER read the whole file at once.\n"
+        "  OBSERVE:  locate_symbol → read_file(offset=0,limit=200) → understand the code\n"
+        "            Always use locate_symbol first to find WHERE to edit.\n"
+        "            ⚠ For files >500 lines: use offset/limit, NEVER read the whole file at once.\n"
         "  EXPLAIN:  [MANDATORY after compile/test FAIL]\n"
         "            analyze_error → root_cause_analyzer\n"
-        "            ⛔ write_file is BLOCKED in this phase\n"
+        "            ⛔ write_file/edit_file/insert_method ALL BLOCKED in this phase\n"
         "            You MUST state: (1) Why error happened (2) Which line is wrong (3) Why fix works\n"
-        "  FIX:      write_file ALLOWED now. Make ONE targeted fix.\n"
+        "  FIX:      edit_file/insert_method/rename_symbol ALLOWED now.\n"
+        "            ⚠ For files >500 lines: ALWAYS use edit_file (NOT write_file).\n"
+        "            edit_file replaces old_text → new_text. Only send the CHANGED region.\n"
         "  VERIFY:   " + verify_req + "\n"
         "  DONE:     all passed, task complete\n"
         f"\nTASK TYPE: {task_profile.type_name}\n"
@@ -1425,8 +1743,8 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
         "\nERROR RECOVERY PROTOCOL (compile or test FAIL):\n"
         "  1. Phase→OBSERVE: call analyze_error(source, error_raw)\n"
         "  2. Phase→EXPLAIN: call root_cause_analyzer(error_summary, code_snippet, expected_behavior)\n"
-        "     ⛔ Do NOT call write_file — it will be REJECTED\n"
-        "  3. Phase→FIX:     now call write_file with the corrected code\n"
+        "     ⛔ Do NOT call edit_file/write_file — it will be REJECTED\n"
+        "  3. Phase→FIX:     now call edit_file with the corrected code (old_text → new_text patch)\n"
         "  4. Phase→VERIFY:  call run_compile, then run_tests\n"
         "  5. If FAIL again → back to step 1. If PASS → DONE.\n"
         "\n"
@@ -1445,12 +1763,19 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
         "ROLLBACK only after 3 failed fix attempts on the SAME error signature.\n"
         "NEVER write a file without reading it first.\n"
         "NEVER skip compilation before running tests.\n"
+        "ARCHITECTURE — Locate → Patch → Verify (for 8B models):\n"
+        "  WRONG: Read Large File → Rewrite Entire File (context overflow, truncation)\n"
+        "  RIGHT: locate_symbol() → edit_file(old_text, new_text) → verify_changes()\n"
+        "  For method/class operations, use the dedicated tools:\n"
+        "    Add method → insert_method(file, after_method, method_source)\n"
+        "    Rename → rename_symbol(old_name, new_name)\n"
+        "    Edit code → edit_file(path, old_text, new_text)\n"
         "CRITICAL — TASK FOCUS: Every 3 steps, the system injects a task reminder.\n"
         "  You MUST execute the task, not just analyze code. Reading is preparation, not completion.\n"
-        "  If the task says 'add/edit/create/rename' — you MUST call write_file with actual changes.\n"
+        "  If the task says 'add/edit/create/rename' — you MUST call edit_file/insert_method/rename_symbol.\n"
         "  Declaring DONE without write/compile/test when the task requires changes will be REJECTED.\n"
         "CRITICAL — LARGE FILES: Always use read_file with limit=200-500. Files can be 3500+ lines.\n"
-        "  Reading entire huge files at once causes context overflow and task loss.\n"
+        "  After locating the symbol, read ONLY the relevant section (offset at the symbol's line).\n"
         "Output your summary in Chinese."
     )
 
@@ -1639,7 +1964,7 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
             if task_profile.strict_explain:
                 blocked_phases.append("observing")
                 blocked_phases.append("idle")
-            if name in ("write_file", "fix_single_error") and state.current_phase in blocked_phases:
+            if name in ("write_file", "fix_single_error", "edit_file", "insert_method", "rename_symbol") and state.current_phase in blocked_phases:
                 block_reason = (
                     f"⛔ write_file BLOCKED — current phase is {state.current_phase.upper()}. "
                 )
@@ -1692,9 +2017,17 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
             if name == "read_file":
                 p = args.get("path", "")
                 if p: state.files_read.add(p)
-            elif name == "write_file":
-                p = args.get("path", "")
+            elif name in ("write_file", "edit_file", "insert_method"):
+                p = args.get("path", args.get("file", ""))
                 if p: state.files_modified.add(p)
+            elif name == "rename_symbol":
+                # Track all changed files from the result
+                r = result.get("result", {})
+                for c in r.get("changes", []):
+                    fp = c.get("file", "")
+                    if fp: state.files_modified.add(fp)
+                # Also set written flag
+                state._has_written = True
             elif name == "run_tests":
                 state.tests_run = True
                 r = result.get("result", {})
@@ -2528,7 +2861,21 @@ class SelfBenchmark:
             if db:
                 profile = db.suggest_profile(t["task"], profile)
 
-            result = agent(t["task"], collect_trace=True, task_profile=profile, failure_db=db)
+            try:
+                result = agent(t["task"], collect_trace=True, task_profile=profile, failure_db=db)
+            except Exception as e:
+                print(f"  [self-bench] Task {t['key']} crashed: {e}")
+                result = {
+                    "compile_success": False, "tests_passed": 0, "tests_failed": 1,
+                    "tool_calls": 0, "duration": 0, "steps": 0,
+                    "rollbacks": 0, "fix_attempts": 0,
+                    "error_repetition_rate": 0, "repeated_error_rate": 0,
+                    "root_cause_hits": 0, "root_cause_misses": 0,
+                    "root_cause_success_rate": 0, "recovery_efficiency": 0,
+                    "gate_interventions": 0, "verified_completion": False,
+                    "phase_summary": {}, "total_analyze_calls": 0,
+                    "exit_reason": f"crash: {str(e)[:100]}",
+                }
             results[t["key"]] = {
                 "name": t["name"],
                 "profile_used": profile.type_name,
