@@ -32,11 +32,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the full contents of a file. Use before modifying any file.",
+            "description": "Read a file, optionally with offset/limit for large files. DEFAULT limit=500 lines. When reading a file for the first time, start with offset=0, limit=200 to see the class header and first methods. Then use additional calls with higher offset to read more. ALWAYS use limit to avoid context overflow — reading 3500+ lines at once WILL cause the model to forget the task.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path relative to project root, e.g. src/main/java/com/example/UserService.java"}
+                    "path": {"type": "string", "description": "Path relative to project root, e.g. src/main/java/com/example/UserService.java"},
+                    "offset": {"type": "integer", "description": "Line number to start reading from (0-indexed). Default 0."},
+                    "limit": {"type": "integer", "description": "Max lines to read. Default 500. For first read, use 200. NEVER omit — files may be 3500+ lines."}
                 },
                 "required": ["path"]
             }
@@ -584,7 +586,34 @@ def dispatch(tool_call: dict) -> dict:
         if not ok: return {"error": real}
         try:
             with open(real) as f:
-                return {"result": f.read()}
+                lines = f.readlines()
+            total_lines = len(lines)
+            offset = args.get("offset", 0)
+            limit = args.get("limit", 500)
+            # Clamp to valid range
+            offset = max(0, min(offset, total_lines - 1))
+            limit = min(limit, total_lines - offset)
+            chunk = "".join(lines[offset:offset + limit])
+            result = {
+                "content": chunk,
+                "file": args["path"],
+                "total_lines": total_lines,
+                "offset": offset,
+                "lines_returned": limit,
+            }
+            # If file is large and user read the whole thing without limit, add a warning
+            if total_lines > 1000 and limit >= total_lines:
+                result["warning"] = (
+                    f"File is {total_lines} lines — very large. "
+                    f"Re-read with offset/limit to focus on specific sections. "
+                    f"Recommended: offset=0,limit=200 (class header), then jump to relevant method."
+                )
+            # If file is truncated, add navigation hint
+            if offset + limit < total_lines:
+                result["truncated"] = True
+                result["next_offset"] = offset + limit
+                result["hint"] = f"File truncated. To continue reading, call read_file with offset={offset + limit}."
+            return {"result": result}
         except FileNotFoundError:
             return {"error": f"not found: {args['path']}"}
 
@@ -933,6 +962,11 @@ class AgentState:
         self.total_analyze_calls: int = 0          # Total analyze_error calls
         # Failure clustering
         self.failure_clusters: dict[str, list[dict]] = {}  # cluster_key → list of error dicts
+        # Action tracking (gate extension: catch "declared done but no action")
+        self._has_written: bool = False       # Any write_file or fix_single_error called
+        self._has_compiled: bool = False      # Any run_compile or verify_changes called
+        self._has_tested: bool = False        # Any run_tests or verify_changes called
+        self._task_action_keywords: list[str] = []  # Action keywords detected in task
 
     def transition(self, tool_name: str, result: dict | None = None, elapsed_ms: float = 0):
         """Drive the workflow state machine based on tool calls."""
@@ -955,11 +989,13 @@ class AgentState:
         elif tool_name == "write_file":
             if self.current_phase in ("explain",):
                 return False  # BLOCKED
+            self._has_written = True
             self.current_phase = "verifying"
             if self._pending_first_fix and not self._fix_written:
                 self._fix_written = True
 
         elif tool_name == "run_compile":
+            self._has_compiled = True
             if isinstance(r, dict) and r.get("success", False):
                 if self.current_phase != "verifying":
                     self.current_phase = "verifying"
@@ -975,6 +1011,7 @@ class AgentState:
                     self._fix_written = False
 
         elif tool_name == "run_tests":
+            self._has_tested = True
             if isinstance(r, dict) and r.get("failed", 0) == 0 and r.get("total", 0) > 0:
                 self.current_phase = "done"
             else:
@@ -983,6 +1020,7 @@ class AgentState:
         elif tool_name == "fix_single_error":
             if self.current_phase in ("explain",):
                 return False  # BLOCKED in EXPLAIN phase
+            self._has_written = True
             if isinstance(r, dict) and r.get("fixed", False):
                 self.current_phase = "verifying"
             else:
@@ -996,6 +1034,8 @@ class AgentState:
                 self._fix_written = False
 
         elif tool_name == "verify_changes":
+            self._has_compiled = True
+            self._has_tested = True
             all_pass = isinstance(r, dict) and r.get("all_pass", False)
             compile_ok = isinstance(r, dict) and r.get("compile") == "PASS"
             if all_pass:
@@ -1088,6 +1128,9 @@ class AgentState:
         self._phase_enter_time = 0.0
         self._pending_first_fix = False
         self._fix_written = False
+        self._has_written = False
+        self._has_compiled = False
+        self._has_tested = False
         self.failure_clusters.clear()
         self.rollbacks += 1
 
@@ -1188,6 +1231,49 @@ class AgentState:
                 lines.append(f"  → FIX TOGETHER: all {len(errors)} errors in this cluster share the same root cause.")
         if self.rollbacks > 0:
             lines.append(f"### Rollbacks: {self.rollbacks}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def detect_action_keywords(task: str) -> list[str]:
+        """Detect if the task expects concrete code changes (not just analysis).
+        Returns list of action verbs found in the task."""
+        action_patterns = [
+            (r"添加|新增|创建|增加|add|create|new", "add"),
+            (r"修改|更改|修改|modify|change|update|fix|修复", "modify"),
+            (r"删除|移除|delete|remove", "delete"),
+            (r"重构|提取|重命名|refactor|extract|rename", "refactor"),
+            (r"编译|测试|compile|test", "verify"),
+        ]
+        found = []
+        for pattern, label in action_patterns:
+            if re.search(pattern, task, re.IGNORECASE):
+                found.append(label)
+        return found
+
+    def task_summary_injection(self, task: str) -> str:
+        """Generate a condensed task reminder to keep the model focused."""
+        # Extract first 120 chars of task as core goal
+        core = task[:200].replace("\n", " ").strip()
+        if len(task) > 200:
+            core += "..."
+
+        lines = [
+            f"## 🎯 CURRENT TASK: {core}",
+        ]
+        # Show what's actually been done
+        if self._has_written:
+            lines.append(f"- ✓ Files modified: {', '.join(sorted(self.files_modified)) if self.files_modified else 'yes'}")
+        else:
+            lines.append("- ⚠ NO files written yet — you MUST call write_file to make changes")
+        if self._has_compiled:
+            lines.append(f"- ✓ Compile: {'PASS' if self.compile_success else 'FAIL'}")
+        else:
+            lines.append("- ⚠ NOT compiled yet — call run_compile after writing")
+        if self._has_tested:
+            lines.append(f"- ✓ Tests: {self.tests_passed}/{ (self.tests_passed or 0) + (self.tests_failed or 0)}")
+        elif self._has_written:
+            lines.append("- ⚠ NOT tested yet — call run_tests after compile passes")
+        lines.append(f"- Phase: {self.current_phase}")
         return "\n".join(lines)
 
 
@@ -1324,7 +1410,8 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
         "              └────────┘←── FAIL ────────┘\n"
         "\n"
         "PHASE RULES (ENFORCED — violations will be BLOCKED):\n"
-        "  OBSERVE:  search_code → read_file → understand the code\n"
+        "  OBSERVE:  search_code → read_file(offset=0,limit=200) → understand the code\n"
+        "            ⚠ For files >800 lines: use offset/limit, NEVER read the whole file at once.\n"
         "  EXPLAIN:  [MANDATORY after compile/test FAIL]\n"
         "            analyze_error → root_cause_analyzer\n"
         "            ⛔ write_file is BLOCKED in this phase\n"
@@ -1358,6 +1445,12 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
         "ROLLBACK only after 3 failed fix attempts on the SAME error signature.\n"
         "NEVER write a file without reading it first.\n"
         "NEVER skip compilation before running tests.\n"
+        "CRITICAL — TASK FOCUS: Every 3 steps, the system injects a task reminder.\n"
+        "  You MUST execute the task, not just analyze code. Reading is preparation, not completion.\n"
+        "  If the task says 'add/edit/create/rename' — you MUST call write_file with actual changes.\n"
+        "  Declaring DONE without write/compile/test when the task requires changes will be REJECTED.\n"
+        "CRITICAL — LARGE FILES: Always use read_file with limit=200-500. Files can be 3500+ lines.\n"
+        "  Reading entire huge files at once causes context overflow and task loss.\n"
         "Output your summary in Chinese."
     )
 
@@ -1378,6 +1471,9 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
     trace_steps = [] if collect_trace else None
     t0 = time.time()
 
+    # Detect action keywords for gate extension
+    state._task_action_keywords = AgentState.detect_action_keywords(task)
+
     messages = [
         {"role": "system", "content": base_system},
         {"role": "user", "content": task},
@@ -1388,8 +1484,27 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
             state_msg = {"role": "system", "content": state.status_text()}
             messages.append(state_msg)
 
-        # Context compression every 5 steps (after step 5)
-        if step >= 5 and step % 5 == 0:
+        # Task summary injection: keep model focused on the goal
+        # Inject at steps 1, 3, 5, ... and whenever phase changes
+        if step > 0 and (step % 3 == 0 or state.current_phase in ("explain", "fixing")):
+            task_reminder = state.task_summary_injection(task)
+            messages.append({"role": "system", "content": task_reminder})
+
+        # Context compression: every 5 steps, OR early trigger on large file read
+        should_compress = (step >= 5 and step % 5 == 0)
+        if not should_compress and step >= 1 and step <= 3:
+            # Check if last read_file returned a large file (>800 lines) → early compress
+            for m in reversed(messages[-4:]):
+                c = m.get("content", "")
+                if "total_lines" in c and '"total_lines":' in c:
+                    try:
+                        total = int(re.search(r'"total_lines":\s*(\d+)', c).group(1))
+                        if total > 800:
+                            should_compress = True
+                            break
+                    except Exception:
+                        pass
+        if should_compress:
             before = len(messages)
             # Extract focus: last method/class mentioned in recent messages
             focus = ""
@@ -1425,22 +1540,44 @@ def agent(task: str, collect_trace: bool = False, task_profile: TaskProfile | No
             content = (msg.content or "")[:500]
             # Verification enforcement: refuse to exit with failing state
             needs_fix = False
+            gate_reasons = []
+
             if state.compile_success is False:
                 needs_fix = True
+                gate_reasons.append("compile FAILED")
             elif not state.tests_run and state.files_modified and state.compile_success is True:
                 needs_fix = True  # Modified files, compile passed, but never ran tests
+                gate_reasons.append("tests not run after modifications")
             elif state.tests_run and state.tests_failed is not None and state.tests_failed > 0:
                 needs_fix = True
+                gate_reasons.append(f"{state.tests_failed} tests FAILED")
             elif state.compile_success is None and state.files_modified:
                 needs_fix = True  # Modified files but never compiled
+                gate_reasons.append("files modified but never compiled")
+            # NEW: Gate extension — "declared done but no action" detection
+            elif state._task_action_keywords and not state._has_written and not state._has_compiled:
+                # Task asks for code changes but model did nothing except read files
+                actions = ", ".join(state._task_action_keywords)
+                needs_fix = True
+                gate_reasons.append(
+                    f"NO-OP detected: task requires action ({actions}) but no write/compile/test executed. "
+                    f"Read files: {len(state.files_read)}. Modified files: 0."
+                )
             if needs_fix and step < MAX_STEPS - 1:
                 state.gate_interventions += 1  # Track false completion
                 pp = state.tests_passed or 0
                 pf = state.tests_failed or 0
-                print(f"  [gate] Refusing exit (#{state.gate_interventions}) — profile={task_profile.type_name}, phase={state.current_phase}, compile={state.compile_success}, tests={pp}/{pp + pf}")
+                gate_reason_str = "; ".join(gate_reasons)
+                print(f"  [gate] Refusing exit (#{state.gate_interventions}) — {gate_reason_str}")
                 injection = "## STATE MACHINE: VERIFY failed — cycle back to OBSERVE\n"
                 injection += f"Task type: {task_profile.type_name}. Current phase: {state.current_phase}.\n"
                 injection += f"Workflow: OBSERVE → EXPLAIN → FIX → VERIFY → DONE\n"
+                injection += f"Gate reason: {gate_reason_str}\n"
+                # NO-OP specific guidance
+                if "NO-OP" in gate_reason_str:
+                    injection += "- ⚠ You declared DONE without making ANY changes. The task requires code modifications.\n"
+                    injection += "- Read the relevant section of the file (use offset/limit to avoid overflow).\n"
+                    injection += "- Then call write_file with the actual changes. Do NOT just analyze — implement.\n"
                 if state.compile_success is False:
                     injection += "- Phase→OBSERVE: compile FAILED. Call analyze_error(source='compile', error_raw=<errors>).\n"
                 elif state.compile_success is None and state.files_modified:
@@ -1908,9 +2045,29 @@ def generate_html_report(all_results: dict, output_path: str):
     """Generate a standalone HTML benchmark report with visualizations."""
     tasks_data = []
     for key, r in all_results.items():
-        cat = "单文件修改" if key.startswith("s") else "跨文件重构" if key.startswith("m") else "错误恢复"
+        # Support both built-in benchmark keys and self-benchmark keys
+        if key in BENCHMARK_TASKS:
+            name = BENCHMARK_TASKS[key]["name"]
+        elif isinstance(r, dict) and "name" in r:
+            name = r["name"]
+        else:
+            name = key
+
+        # Category detection
+        if key.startswith("self_s"):
+            cat = "单文件修改"
+        elif key.startswith("self_m"):
+            cat = "跨文件重构"
+        elif key.startswith("self_e"):
+            cat = "错误恢复"
+        elif key.startswith("s"):
+            cat = "单文件修改"
+        elif key.startswith("m"):
+            cat = "跨文件重构"
+        else:
+            cat = "错误恢复"
         tasks_data.append({
-            "key": key, "name": BENCHMARK_TASKS[key]["name"], "cat": cat,
+            "key": key, "name": name, "cat": cat,
             "compile": r["compile_success"], "tools": r["tool_calls"],
             "tests_passed": r.get("tests_passed", 0),
             "tests_failed": r.get("tests_failed", 0),
@@ -2647,7 +2804,9 @@ if __name__ == "__main__":
         # Convert results to format compatible with generate_html_report
         report_data = {}
         for key, r in results.get("results", {}).items():
-            report_data[key] = r["result"]
+            entry = dict(r["result"])  # copy agent metrics
+            entry["name"] = r.get("name", key)  # inject task name for HTML report
+            report_data[key] = entry
 
         if args.visualize and report_data:
             generate_html_report(report_data, report_path)
